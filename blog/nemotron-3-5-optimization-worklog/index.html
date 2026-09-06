@@ -1,0 +1,994 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-E00L9PT3V9"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-E00L9PT3V9');
+  </script>
+
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="author" content="Naveenraj Kamalakannan">
+  <meta name="description" content="I came across NVIDIA’s Nemotron 3.5 Lightning model recently. I rented a RTX PRO 6000 box, thanks to Huggingface and Modal for their GPU credits! I had Claud...">
+
+  <title>Let's optimize Nemotron 3.5 Lightning - a worklog - Naveenraj Kamalakannan</title>
+
+  <link rel="canonical" href="https://itsnav.com/blog/nemotron-3-5-optimization-worklog/">
+
+  
+  
+  
+  <meta property="og:site_name" content="Naveenraj Kamalakannan">
+  <meta property="og:type" content="article">
+  <meta property="og:title" content="Let's optimize Nemotron 3.5 Lightning - a worklog">
+  <meta property="og:description" content="Serving NVIDIA's Nemotron 3.5 Lightning on one RTX PRO 6000: BF16 to W4A4 NVFP4, a quantized MTP drafter, and one CUDA graph for the draft passes. 179 to ~465 tokens/sec per query, 91.5 to 49 ms to...">
+  <meta property="og:url" content="https://itsnav.com/blog/nemotron-3-5-optimization-worklog/">
+  <meta property="og:image" content="https://itsnav.com/blog_assets/og_poster.png">
+  <meta property="og:image:alt" content="Let's optimize Nemotron 3.5 Lightning: 179 to 465 tokens/sec per query on one RTX PRO 6000, with the per-step bar chart">
+  <meta property="article:published_time" content="2026-09-05T04:00:00+00:00">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Let's optimize Nemotron 3.5 Lightning - a worklog">
+  <meta name="twitter:description" content="Serving NVIDIA's Nemotron 3.5 Lightning on one RTX PRO 6000: BF16 to W4A4 NVFP4, a quantized MTP drafter, and one CUDA graph for the draft passes. 179 to ~465 tokens/sec per query, 91.5 to 49 ms to...">
+  <meta name="twitter:image" content="https://itsnav.com/blog_assets/og_poster.png">
+  <link rel="icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <script>
+    if (localStorage.getItem("theme") === "dark") document.documentElement.classList.add("dark");
+  </script>
+</head>
+
+<body>
+  <header class="site-header">
+    <nav class="site-nav">
+      <span class="site-title-group">
+        <a class="site-title" href="/">Naveenraj Kamalakannan</a>
+        <button class="theme-toggle" id="theme-toggle" aria-label="Toggle dark mode">
+          <svg id="icon-moon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+          <svg id="icon-sun" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
+        </button>
+      </span>
+      <div class="nav-links">
+        <a href="/">About</a>
+        <a href="/blog/">Blog</a>
+        <a href="/pdfs/Naveen_Resume_Aug_2026.pdf">CV</a>
+      </div>
+    </nav>
+  </header>
+
+  <main class="container">
+    <article class="post">
+  <header class="post-header">
+    <h1 class="post-title">Let's optimize Nemotron 3.5 Lightning - a worklog</h1>
+    <p class="post-meta">
+      Date: <time datetime="2026-09-05T04:00:00+00:00">September 5, 2026</time>
+      | Estimated Reading Time: 12 min
+      
+      |
+      <span class="tag">quantization</span><span class="tag">vllm</span><span class="tag">nvfp4</span><span class="tag">mtp</span><span class="tag">speculative-decoding</span>
+      
+    </p>
+  </header>
+
+  
+
+
+
+
+<details class="toc" open>
+  <summary>Table of Contents</summary>
+  <ul><li class="toc-h2"><a href="#step-0-serving-bf16-checkpoint">Step 0: Serving BF16 checkpoint</a></li><li class="toc-h2"><a href="#step-1-w4a16---quantize-the-weights">Step 1: W4A16 - quantize the weights</a></li><li class="toc-h2"><a href="#step-2-w4a4---quantize-everything">Step 2: W4A4 - Quantize Everything</a></li><li class="toc-h2"><a href="#step-3-w4a4-checkpoint-with-the-right-coverage">Step 3: W4A4 checkpoint with the right coverage</a></li><li class="toc-h2"><a href="#step-4-lm-head-quantization">Step 4: LM Head Quantization</a></li><li class="toc-h2"><a href="#interlude-why-didnt-decode-get-faster">Interlude: why didn’t decode get faster?</a></li><li class="toc-h2"><a href="#step-5-mtp-speculative-decoding---the-model-drafts-for-itself">Step 5: MTP speculative decoding - the model drafts for itself</a></li><li class="toc-h2"><a href="#step-6-quantize-the-drafter">Step 6: quantize the drafter</a></li><li class="toc-h2"><a href="#step-7-prep-stall-in-drafter">Step 7: prep stall in drafter</a></li><li class="toc-h2"><a href="#coming-in-part-2-filling-the-gpu">Coming in Part 2: filling the GPU</a></li></ul>
+</details>
+
+
+
+  <div class="post-content">
+    <p>I came across NVIDIA’s Nemotron 3.5 Lightning model recently. I rented a RTX PRO 6000 box, thanks to Huggingface and Modal for their GPU credits! I had Claude Fable. So yeah, spent my weekend on squeezing as much as possible to serve this model. What you’ll be reading is a worklog of how I approached this optimization setup. Please feel free to reach out to me if you have any questions / feedback.</p>
+
+<p>TL;DR worklog numbers:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>step</th>
+      <th>change</th>
+      <th>TPOT ↓</th>
+      <th>TTFT</th>
+      <th>tok/s per query</th>
+      <th>ppl</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>0</td>
+      <td>BF16 baseline</td>
+      <td>5.58 ms</td>
+      <td>91.5 ms</td>
+      <td>179</td>
+      <td><strong>2.502</strong></td>
+    </tr>
+    <tr>
+      <td>1</td>
+      <td>our W4A16 (weights only)</td>
+      <td>3.07 ms</td>
+      <td>153 ms</td>
+      <td>325</td>
+      <td>2.520</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>our W4A4, quantize everything</td>
+      <td>3.25 ms</td>
+      <td>107 ms</td>
+      <td>~308</td>
+      <td>3.296 ✗</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>our W4A4, right coverage</td>
+      <td>3.47 ms</td>
+      <td>120 ms</td>
+      <td>~288</td>
+      <td>2.595</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>+ quantize the LM head</td>
+      <td>3.16 ms</td>
+      <td>104 ms</td>
+      <td>317</td>
+      <td>2.551</td>
+    </tr>
+    <tr>
+      <td>5</td>
+      <td>+ MTP speculative decoding (k=3, BF16 drafter)</td>
+      <td>2.31 ms</td>
+      <td><strong>47 ms</strong></td>
+      <td>404</td>
+      <td>lossless</td>
+    </tr>
+    <tr>
+      <td>6</td>
+      <td>+ quantized drafter</td>
+      <td>2.21 ms</td>
+      <td>48 ms</td>
+      <td>418</td>
+      <td>lossless</td>
+    </tr>
+    <tr>
+      <td>7</td>
+      <td>+ drafter passes as one CUDA graph, prefix caching off</td>
+      <td><strong>1.97 ms</strong></td>
+      <td>49 ms</td>
+      <td><strong>~465</strong></td>
+      <td>lossless</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>Note:</p>
+<ul>
+  <li>“lossless” means in speculative decoding every draft token is verified against the full model, so the output distribution is unchanged and verified.</li>
+</ul>
+
+<p><img src="/blog_assets/11_hook_bars.png" alt="Decode throughput and TTFT across every step of the worklog" /></p>
+
+<p class="caption">Grey is the official BF16 baseline. Blue is our optimization efforts. Red is the naive quantize-everything run, which failed the quality gate.</p>
+
+<p>This post is about a single request: one prompt, one RTX PRO 6000, lowest TTFT and TPOT I can get. Concurrency is a different problem (this checkpoint already does <strong>~4,578 tokens/sec in aggregate</strong> at concurrency 256) and that’s Part 2.</p>
+
+<p>Hardware: one RTX PRO 6000 Blackwell Server Edition (sm120, 188 SMs, 1.60 TB/s memory bandwidth).</p>
+
+<p>Software: vLLM 0.28.0rc2, plus a few custom changes.</p>
+
+<p>Three terms: <strong>TPOT</strong> (time per output token) is decode speed. <strong>TTFT</strong> (time to first token) is prefill speed. <strong>Throughput</strong> is tokens/sec: per query in this post, aggregate across all concurrent requests in Part 2. TPOT and TTFT are bounded by different parts of the hardware, which is most of what this post is about.</p>
+
+<h2 id="step-0-serving-bf16-checkpoint">Step 0: Serving BF16 checkpoint</h2>
+
+<p>Stock vLLM:</p>
+
+<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code>vllm serve nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 \
+  --max-model-len 16384 \
+  --max-num-seqs 256 \
+  --tensor-parallel-size 1
+</code></pre></div></div>
+
+<p><code class="language-plaintext highlighter-rouge">--max-num-seqs 256</code> is not tuning. This is a 23-layer Mamba hybrid, every decode sequence holds a Mamba state block, and vLLM’s default of 1024 doesn’t fit and kills CUDA graph capture. That cost me my first hour!</p>
+
+<p>TTFT: 91.5 ms, TPOT: 5.58 ms</p>
+
+<p><img src="/blog_assets/pf_bf16_rangesel.png" alt="One BF16 decode step, range-selected in Perfetto with its kernel breakdown" /></p>
+
+<p class="caption">One BF16 decode step. The kernels are closely packed with no gaps, so there is no idle backlogs to win. The single widest kernel is the BF16 lm_head, the <code class="language-plaintext highlighter-rouge">gemvx</code> one (the bottom one): 479 µs per call. lm_head turns the last hidden state into one token’s logits.</p>
+
+<p>179 tokens/sec for a single request. Not bad. Where is the ceiling?</p>
+
+<p>30B params × 2 bytes is 60 GB, but this is a MoE: only 6 of 128 experts fire per token, so the active set is ~3B params. The dense parts (Mamba projections, shared experts, attention, the output head) are read on every step regardless, which brings the bytes actually touched per token to about 3.5B params, or ~7 GB in BF16. If decode did nothing but stream those weights at peak bandwidth:</p>
+
+\[\frac{1600\ \text{GB/s}}{7\ \text{GB/token}} \approx 229\ \text{tok/s}\]
+
+<p>But we’ve achieved 179 tok/s, so</p>
+
+\[\frac{179\ \text{tok/s}}{229\ \text{tok/s}} \approx 78\%\]
+
+<p>of the card’s memory bandwidth, before any optimization (I mean vLLM is already optimized). Now what? Is there a way to bring down the 7 GB? Yes you’re right, it’s quantization! (Batching would amortize the reads across requests, but that’s not the goal here.)</p>
+
+<p>One more number to keep: TTFT is 91.5 ms, and it is about to get worse.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>step</th>
+      <th>change</th>
+      <th>TPOT ↓</th>
+      <th>TTFT (1k)</th>
+      <th>tok/s</th>
+      <th>ppl</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>0</td>
+      <td>BF16 baseline</td>
+      <td><strong>5.58 ms</strong></td>
+      <td><strong>91.5 ms</strong></td>
+      <td><strong>179</strong></td>
+      <td><strong>2.502</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="step-1-w4a16---quantize-the-weights">Step 1: W4A16 - quantize the weights</h2>
+
+<p>The obvious first move: 4-bit weights, BF16 activations. The format is NVIDIA’s <a href="https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/">NVFP4</a>: 4 bits per weight, with <code class="language-plaintext highlighter-rouge">group_size = 16</code>. I built the checkpoint with NVIDIA’s ModelOpt repo. Decode now reads 4× fewer weight bytes per token.</p>
+
+<p>TPOT: 3.07 ms, 1.8× over BF16, about what the bytes math predicts. Weight-only quantization is a good deal and most people should stop here.</p>
+
+<p>TTFT went the other way: <strong>91.5 → 153.3 ms, prefill 67% slower.</strong> Prefill pushes the whole prompt (~1k tokens) through the model at once, so the op is compute-bound. The Marlin kernel stores 4-bit weights but dequantizes them to 16-bit inside the kernel and does the math in BF16. At decode this dequant can be overlapped with memory read making the arithmetic essentially free. At prefill it is extra work on the hot path! And we’re not using the native FP4 cores, that’s bad.</p>
+
+<p><img src="/blog_assets/pf_w4a16_prefill.png" alt="One MoE layer during W4A16 prefill" /></p>
+
+<p class="caption">One MoE layer at prefill. The two Marlin GEMMs: 396.8 and 338.5 µs to push 1000 tokens through. The same two calls take ~20 µs each at decode. This is the entire TTFT regression.</p>
+
+<p>That asymmetry is the rest of the post. Blackwell has native FP4 tensor cores, up to 4× BF16 throughput, but they need 4-bit activations too. That’s W4A4.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>step</th>
+      <th>change</th>
+      <th>TPOT ↓</th>
+      <th>TTFT (1k)</th>
+      <th>tok/s</th>
+      <th>ppl</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>0</td>
+      <td>BF16 baseline</td>
+      <td>5.58 ms</td>
+      <td><strong>91.5 ms</strong></td>
+      <td>179</td>
+      <td><strong>2.502</strong></td>
+    </tr>
+    <tr>
+      <td>1</td>
+      <td>our W4A16 (weights only)</td>
+      <td><strong>3.07 ms</strong></td>
+      <td>153 ms</td>
+      <td><strong>325</strong></td>
+      <td>2.520</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="step-2-w4a4---quantize-everything">Step 2: W4A4 - Quantize Everything</h2>
+
+<p><strong>Expectation:</strong> the model card says Nemotron was pretrained with NVFP4, the expert layers ran 4-bit weights and activations during training, so 4-bit activations at inference should be gentle. I naively quantized everything quantizable to W4A4 with NVIDIA’s “four-over-six” weight-scaling recipe and 1000 calibration samples.</p>
+
+<p><strong>Result: perplexity 3.296.</strong> didn’t expect this…generations fall into repetition loops, “====” and speed barely improved.</p>
+
+<p>I gave up the project here for a while. My notes literally say “W4A16 is good enough, just ship it.” That conclusion was wrong. I hadn’t yet worked out <strong>which layers can take 4-bit activations</strong>. Did I just expect a recurrent Mamba state to play well with quant error!?</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>step</th>
+      <th>change</th>
+      <th>TPOT ↓</th>
+      <th>TTFT (1k)</th>
+      <th>tok/s</th>
+      <th>ppl</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>0</td>
+      <td>BF16 baseline</td>
+      <td>5.58 ms</td>
+      <td><strong>91.5 ms</strong></td>
+      <td>179</td>
+      <td><strong>2.502</strong></td>
+    </tr>
+    <tr>
+      <td>1</td>
+      <td>our W4A16 (weights only)</td>
+      <td><strong>3.07 ms</strong></td>
+      <td>153 ms</td>
+      <td><strong>325</strong></td>
+      <td>2.520</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>W4A4, quantize everything</td>
+      <td>3.25 ms</td>
+      <td>107 ms</td>
+      <td>~308</td>
+      <td>3.296 ✗</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="step-3-w4a4-checkpoint-with-the-right-coverage">Step 3: W4A4 checkpoint with the right coverage</h2>
+
+<p>Digging with Claude Fable turned up that Nemotron Super 120B ships with an actual W4A4 recipe from NVIDIA, and it <strong>DOES NOT</strong> quantize everything:</p>
+
+<ul>
+  <li><strong>Routed experts</strong> → 4-bit weights and activations. Sparse (6 of 128 fire per token) and FP4-native from pretraining.</li>
+  <li><strong>Shared experts</strong> → FP8. They run on every token, so error there is paid on every token.</li>
+  <li><strong>Mamba projections</strong> → FP8. Mamba layers carry recurrent state and quantization error compounds across the sequence. I had forgotten about Mamba entirely.</li>
+  <li><strong>Attention and router</strong> → BF16.</li>
+</ul>
+
+<p>This is my quant config yaml:</p>
+
+<div class="language-yaml highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="na">quant_cfg</span><span class="pi">:</span>
+  <span class="c1"># ROUTED MoE experts -&gt; W4A4</span>
+  <span class="pi">-</span> <span class="na">quantizer_name</span><span class="pi">:</span> <span class="s1">'</span><span class="s">*mlp.experts*weight_quantizer'</span>
+    <span class="na">cfg</span><span class="pi">:</span> <span class="pi">{</span><span class="nv">$import</span><span class="pi">:</span> <span class="nv">nvfp4_four_over_six</span><span class="pi">}</span>
+  <span class="pi">-</span> <span class="na">quantizer_name</span><span class="pi">:</span> <span class="s1">'</span><span class="s">*mlp.experts*input_quantizer'</span>
+    <span class="na">cfg</span><span class="pi">:</span> <span class="pi">{</span><span class="nv">$import</span><span class="pi">:</span> <span class="nv">nvfp4_dynamic</span><span class="pi">}</span>
+
+  <span class="c1"># SHARED experts -&gt; FP8 per-tensor W8A8</span>
+  <span class="pi">-</span> <span class="na">quantizer_name</span><span class="pi">:</span> <span class="s1">'</span><span class="s">*shared_experts*'</span>
+    <span class="na">cfg</span><span class="pi">:</span> <span class="pi">{</span><span class="nv">num_bits</span><span class="pi">:</span> <span class="nv">e4m3</span><span class="pi">}</span>
+
+  <span class="c1"># Mamba mixer projections -&gt; FP8 per-tensor W8A8</span>
+  <span class="pi">-</span> <span class="na">quantizer_name</span><span class="pi">:</span> <span class="s1">'</span><span class="s">*mixer.in_proj*'</span>
+    <span class="na">cfg</span><span class="pi">:</span> <span class="pi">{</span><span class="nv">num_bits</span><span class="pi">:</span> <span class="nv">e4m3</span><span class="pi">}</span>
+  <span class="pi">-</span> <span class="na">quantizer_name</span><span class="pi">:</span> <span class="s1">'</span><span class="s">*mixer.out_proj*'</span>
+    <span class="na">cfg</span><span class="pi">:</span> <span class="pi">{</span><span class="nv">num_bits</span><span class="pi">:</span> <span class="nv">e4m3</span><span class="pi">}</span>
+
+  <span class="c1"># Attention, router, norms, embeddings -&gt; BF16, untouched</span>
+</code></pre></div></div>
+
+<p>I ported this coverage to Lightning, plus one addition: <code class="language-plaintext highlighter-rouge">act_headroom</code>, a newer activation-scale calibrator that leaves room for outlier activations instead of clipping at the observed max.</p>
+
+<p>Result: perplexity 2.595, down from 3.296. Coverage alone recovered 0.70 of perplexity. This is sorted now.</p>
+
+<p>TTFT: ~120 ms, 22% faster than our weight-only W4A16. FP4 tensor cores doing FP4 math at prefill, as Step 1 predicted. Can we still do better?</p>
+
+<p><img src="/blog_assets/pf_prefill_sidebyside.png" alt="Prefill MoE layer, both checkpoints" /></p>
+
+<p class="caption">Same prefill MoE layer. Top (W4A16) runs Marlin: 396.8 + 338.5 µs. Bottom (our W4A4) runs CUTLASS FP4: 177.9 + 136.2 µs, plus a few small FP4 setup kernels.</p>
+
+<p>TPOT is 3.47 ms, slower than W4A16’s 3.07. More quantization, slower decode. I profile that properly in the interlude.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>step</th>
+      <th>change</th>
+      <th>TPOT ↓</th>
+      <th>TTFT (1k)</th>
+      <th>tok/s</th>
+      <th>ppl</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>0</td>
+      <td>BF16 baseline</td>
+      <td>5.58 ms</td>
+      <td><strong>91.5 ms</strong></td>
+      <td>179</td>
+      <td><strong>2.502</strong></td>
+    </tr>
+    <tr>
+      <td>1</td>
+      <td>our W4A16 (weights only)</td>
+      <td><strong>3.07 ms</strong></td>
+      <td>153 ms</td>
+      <td><strong>325</strong></td>
+      <td>2.520</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>W4A4, quantize everything</td>
+      <td>3.25 ms</td>
+      <td>107 ms</td>
+      <td>~308</td>
+      <td>3.296 ✗</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>W4A4, right coverage</td>
+      <td>3.47 ms</td>
+      <td>120 ms</td>
+      <td>~288</td>
+      <td>2.595</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="step-4-lm-head-quantization">Step 4: LM Head Quantization</h2>
+
+<p>One dense layer was still BF16: the lm_head. 131,072-token vocabulary × 2,688 hidden = 352M parameters, read from memory on every step to produce one token’s logits.</p>
+
+<p>704 MB in BF16 → 176 MB in NVFP4 saves 528 MB of reads per step, ~330 µs at 1.60 TB/s.</p>
+
+<p>The recipe change is two lines:</p>
+
+<div class="language-yaml highlighter-rouge"><div class="highlight"><pre class="highlight"><code>  <span class="c1"># LM HEAD -&gt; W4A16 four-over-six.</span>
+  <span class="pi">-</span> <span class="na">quantizer_name</span><span class="pi">:</span> <span class="s1">'</span><span class="s">lm_head.weight_quantizer'</span>
+    <span class="na">enable</span><span class="pi">:</span> <span class="kc">true</span>
+    <span class="na">cfg</span><span class="pi">:</span> <span class="pi">{</span><span class="nv">$import</span><span class="pi">:</span> <span class="nv">nvfp4_four_over_six</span><span class="pi">}</span>
+</code></pre></div></div>
+
+<p><strong>Result: TPOT 3.47 → 3.16 ms. Predicted 330 µs, saved 330 µs.</strong> Perplexity 2.551, within 1.2% of the weight-only checkpoint.</p>
+
+<p><img src="/blog_assets/pf_v11_lmhead.png" alt="The lm_head kernel selected in Perfetto" /></p>
+
+<p class="caption">The quantized lm_head selected in Perfetto: 139 µs per step to read the 176 MB vocab matrix and produce one token’s logits.</p>
+
+<p>Okay, now prefill is much faster, decode still 3% slower than W4A16.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>step</th>
+      <th>change</th>
+      <th>TPOT ↓</th>
+      <th>TTFT (1k)</th>
+      <th>tok/s</th>
+      <th>ppl</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>0</td>
+      <td>BF16 baseline</td>
+      <td>5.58 ms</td>
+      <td><strong>91.5 ms</strong></td>
+      <td>179</td>
+      <td><strong>2.502</strong></td>
+    </tr>
+    <tr>
+      <td>1</td>
+      <td>our W4A16 (weights only)</td>
+      <td><strong>3.07 ms</strong></td>
+      <td>153 ms</td>
+      <td><strong>325</strong></td>
+      <td>2.520</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>W4A4, quantize everything</td>
+      <td>3.25 ms</td>
+      <td>107 ms</td>
+      <td>~308</td>
+      <td>3.296 ✗</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>W4A4, right coverage</td>
+      <td>3.47 ms</td>
+      <td>120 ms</td>
+      <td>~288</td>
+      <td>2.595</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>+ quantize the LM head</td>
+      <td>3.16 ms</td>
+      <td>104 ms</td>
+      <td>317</td>
+      <td>2.551</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="interlude-why-didnt-decode-get-faster">Interlude: why didn’t decode get faster?</h2>
+
+<p>W4A4 made prefill 22% faster than W4A16, but decode is slower. I traced one decode step of each checkpoint before optimizing anything else.</p>
+
+<p>At batch size 1, a GEMM is a memory read. The whole weight matrix streams in from HBM to multiply against one row of activations; the arithmetic is nearly free and the traffic is everything. Both checkpoints store the same 4-bit weights, so they read the same bytes. 4-bit activations cannot speed up decode because decode is not compute-bound. They only paid off at prefill.</p>
+
+<p><img src="/blog_assets/pf_moe_sidebyside.png" alt="One MoE layer at decode, both checkpoints" /></p>
+
+<p class="caption">One MoE layer at decode. The two expert GEMMs are slower on our W4A4 (bottom, CUTLASS: 25.41 + 19.58 µs) than on W4A16 (top, Marlin: 21.70 + 17.63 µs), plus a few small FP4 setup kernels.</p>
+
+<p>So decode is stuck at batch size 1, not stuck in general. If one token can’t keep the hardware busy, the fix is more tokens per step, not a better kernel.</p>
+
+<h2 id="step-5-mtp-speculative-decoding---the-model-drafts-for-itself">Step 5: MTP speculative decoding - the model drafts for itself</h2>
+
+<p>More tokens per step is speculative decoding: a small drafter proposes k tokens, the big model verifies all of them in one pass, and rejection sampling keeps the output distribution identical. This model has a built-in MTP head in the checkpoint, trained to predict the token after next. I turned it on at k=3. Acceptance on real text is nearly flat per position (0.65 / 0.60 / 0.56), about 2.8 accepted tokens per step.</p>
+
+<p><strong>Result: TPOT 2.31 ms, ~404 tokens/sec per query, TTFT ~47 ms.</strong> Every step now verifies four tokens at once, which is exactly the batch-size-1 problem from the interlude going away. Fastest config so far, and I could have stopped here…haha, two more steps please!</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>step</th>
+      <th>change</th>
+      <th>TPOT ↓</th>
+      <th>TTFT</th>
+      <th>tok/s</th>
+      <th>ppl</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>0</td>
+      <td>BF16 baseline</td>
+      <td>5.58 ms</td>
+      <td>91.5 ms</td>
+      <td>179</td>
+      <td><strong>2.502</strong></td>
+    </tr>
+    <tr>
+      <td>1</td>
+      <td>our W4A16 (weights only)</td>
+      <td>3.07 ms</td>
+      <td>153 ms</td>
+      <td>325</td>
+      <td>2.520</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>W4A4, quantize everything</td>
+      <td>3.25 ms</td>
+      <td>107 ms</td>
+      <td>~308</td>
+      <td>3.296 ✗</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>W4A4, right coverage</td>
+      <td>3.47 ms</td>
+      <td>120 ms</td>
+      <td>~288</td>
+      <td>2.595</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>+ quantize the LM head</td>
+      <td>3.16 ms</td>
+      <td>104 ms</td>
+      <td>317</td>
+      <td>2.551</td>
+    </tr>
+    <tr>
+      <td>5</td>
+      <td>+ MTP k=3 (BF16 drafter)</td>
+      <td><strong>2.31 ms</strong></td>
+      <td><strong>47 ms</strong></td>
+      <td><strong>404</strong></td>
+      <td>lossless</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="step-6-quantize-the-drafter">Step 6: quantize the drafter</h2>
+
+<p>The MTP head is a full transformer block with its own attention and its own 128-expert MoE, and it ships in BF16. So on a 4-bit checkpoint the drafter was still running 16-bit GEMMs: ~805 µs per step.</p>
+
+<p>I quantized the drafter’s experts to the same NVFP4 by hand, because the exporter never touches the MTP block.</p>
+
+<p>Two issues:</p>
+
+<ul>
+  <li>The quantization metadata lives in three places and vLLM only reads the copy in <code class="language-plaintext highlighter-rouge">config.json</code>.</li>
+  <li>Even with 4-bit weights, vLLM builds the drafter unquantized by default and bit-casts the packed tensors into BF16. Output still correct (rejection sampling), just no speedup but the acceptance was 1.03. Fix: <code class="language-plaintext highlighter-rouge">"quantization": "modelopt_mixed"</code> in the speculative config.</li>
+</ul>
+
+<p>Acceptance held at 2.80, same as the BF16 drafter. <strong>Result: TPOT 2.31 → 2.21 ms, ~418 tokens/sec per query, TTFT ~48 ms.</strong></p>
+
+<table>
+  <thead>
+    <tr>
+      <th>step</th>
+      <th>change</th>
+      <th>TPOT ↓</th>
+      <th>TTFT</th>
+      <th>tok/s</th>
+      <th>ppl</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>0</td>
+      <td>BF16 baseline</td>
+      <td>5.58 ms</td>
+      <td>91.5 ms</td>
+      <td>179</td>
+      <td><strong>2.502</strong></td>
+    </tr>
+    <tr>
+      <td>1</td>
+      <td>our W4A16 (weights only)</td>
+      <td>3.07 ms</td>
+      <td>153 ms</td>
+      <td>325</td>
+      <td>2.520</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>W4A4, quantize everything</td>
+      <td>3.25 ms</td>
+      <td>107 ms</td>
+      <td>~308</td>
+      <td>3.296 ✗</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>W4A4, right coverage</td>
+      <td>3.47 ms</td>
+      <td>120 ms</td>
+      <td>~288</td>
+      <td>2.595</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>+ quantize the LM head</td>
+      <td>3.16 ms</td>
+      <td>104 ms</td>
+      <td>317</td>
+      <td>2.551</td>
+    </tr>
+    <tr>
+      <td>5</td>
+      <td>+ MTP k=3 (BF16 drafter)</td>
+      <td>2.31 ms</td>
+      <td><strong>47 ms</strong></td>
+      <td>404</td>
+      <td>lossless</td>
+    </tr>
+    <tr>
+      <td>6</td>
+      <td>+ quantized drafter</td>
+      <td><strong>2.21 ms</strong></td>
+      <td>48 ms</td>
+      <td><strong>418</strong></td>
+      <td>lossless</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>I was going to call this the final config. Then I traced a decode step one more time. Last one, I promise!</p>
+
+<h2 id="step-7-prep-stall-in-drafter">Step 7: prep stall in drafter</h2>
+
+<p>The trace showed the GPU idle for about a quarter of every step, as a stall after the drafter’s third pass while Python prepared the next step. Roughly 6 ms of host work per ~5.3 ms of GPU work: the GPU finishes and waits.</p>
+
+<p>Fix: <strong>Record the drafter’s 2nd and 3rd passes as one CUDA graph.</strong> A small vLLM plugin to capture and launch one full CUDAGraph. The trace confirmed 1.27 ms less host time per step.</p>
+
+<p>With prefix caching on, this Mamba hybrid waits for the accepted-token count on the CPU before it can prepare the next step, a <code class="language-plaintext highlighter-rouge">synchronize()</code> every step. Prefix caching does nothing for a single stream, so I turned it off.</p>
+
+<p><img src="/blog_assets/pf_step7_sidebyside.png" alt="One decode step before and after Step 7" /></p>
+
+<p class="caption">One decode step. Step 6 (top) at 7 ms 425 µs, Step 7 (bottom) at 5 ms 483 µs. Same GPU work (same three <code class="language-plaintext highlighter-rouge">execute_context</code> graphs in both kernel tables). The long empty stretch after the drafter’s kernels at the top-right strip is the GPU waiting for Python.</p>
+
+<p><strong>Result: TPOT 2.21 → 1.97 ms, ~465 tokens/sec per query, TTFT ~49 ms.</strong> 12% faster than Step 6, and within ~5% of the GPU floor (1.88 ms/token, the step’s GPU work alone). vLLM’s newer opt-in model runner fixes the same problem its own way, fused draft passes and no CPU sync.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>step</th>
+      <th>change</th>
+      <th>TPOT ↓</th>
+      <th>TTFT</th>
+      <th>tok/s</th>
+      <th>ppl</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>0</td>
+      <td>BF16 baseline</td>
+      <td>5.58 ms</td>
+      <td>91.5 ms</td>
+      <td>179</td>
+      <td><strong>2.502</strong></td>
+    </tr>
+    <tr>
+      <td>1</td>
+      <td>our W4A16 (weights only)</td>
+      <td>3.07 ms</td>
+      <td>153 ms</td>
+      <td>325</td>
+      <td>2.520</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>W4A4, quantize everything</td>
+      <td>3.25 ms</td>
+      <td>107 ms</td>
+      <td>~308</td>
+      <td>3.296 ✗</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>W4A4, right coverage</td>
+      <td>3.47 ms</td>
+      <td>120 ms</td>
+      <td>~288</td>
+      <td>2.595</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>+ quantize the LM head</td>
+      <td>3.16 ms</td>
+      <td>104 ms</td>
+      <td>317</td>
+      <td>2.551</td>
+    </tr>
+    <tr>
+      <td>5</td>
+      <td>+ MTP k=3 (BF16 drafter)</td>
+      <td>2.31 ms</td>
+      <td><strong>47 ms</strong></td>
+      <td>404</td>
+      <td>lossless</td>
+    </tr>
+    <tr>
+      <td>6</td>
+      <td>+ quantized drafter</td>
+      <td>2.21 ms</td>
+      <td>48 ms</td>
+      <td>418</td>
+      <td>lossless</td>
+    </tr>
+    <tr>
+      <td>7</td>
+      <td>+ drafter passes as one CUDA graph, prefix caching off</td>
+      <td><strong>1.97 ms</strong></td>
+      <td>49 ms</td>
+      <td><strong>~465</strong></td>
+      <td>lossless</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>Final: <strong>179 → ~465 tokens/sec per query, 91.5 → 49 ms to first token</strong> on one RTX PRO 6000. 2.6× the per-query throughput of the BF16 baseline and first-token latency nearly halved, from a checkpoint and a serving recipe built along the way.</p>
+
+<h2 id="coming-in-part-2-filling-the-gpu">Coming in Part 2: filling the GPU</h2>
+
+<p>This post optimized one request at a time. How many tokens per second one GPU can push when packed with concurrent requests needs a different optimization setup: KV-cache admission, the Mamba-state paging that caps it, and speculative decoding starting to hurt once the machine is full. Same GPU, same checkpoint, ~4,578 tokens/sec in aggregate at concurrency 256. How that number was reached, and the benchmarking traps on the way, is the next post.</p>
+
+<p>The checkpoint is on Hugging Face, serving flags on the card: <a href="https://huggingface.co/naveenrajk/nemotron35-w4a4-v13">naveenrajk/nemotron35-w4a4-v13</a>.</p>
+
+  </div>
+
+  <footer class="post-footer">
+    <a href="/blog/">&larr; All posts</a>
+  </footer>
+</article>
+
+<style>
+  /* figures: break out of the 720px text column and signal clickability */
+  .post-content img {
+    display: block;
+    width: min(1000px, calc(100vw - 2rem));
+    max-width: none;
+    position: relative;
+    left: 50%;
+    transform: translateX(-50%);
+    cursor: zoom-in;
+  }
+  /* figure captions (kramdown {:.caption}) - deliberately unlike body text */
+  .post-content p.caption {
+    width: min(1000px, calc(100vw - 2rem));
+    max-width: none;
+    position: relative; left: 50%; transform: translateX(-50%);
+    box-sizing: border-box;
+    margin: -0.25rem auto 2.4rem;
+    padding: 0.55rem 0 0 0.9rem;
+    border-top: 1px solid var(--border, #e5e5e8);
+    font-size: 0.8rem;
+    line-height: 1.55;
+    letter-spacing: 0.01em;
+    color: var(--text-soft, #6d6d76);
+    font-style: normal;
+    text-align: left;
+  }
+  .post-content p.caption::before {
+    content: "Figure";
+    display: inline-block;
+    margin-right: 0.6rem;
+    font-size: 0.66rem;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: #2a78d6;
+    vertical-align: 1px;
+  }
+  .post-content p.caption code {
+    font-size: 0.9em;
+    background: var(--code-bg, #f0f0f0);
+    padding: 0.05em 0.3em;
+  }
+
+  #lb-overlay {
+    position: fixed; inset: 0; z-index: 1000;
+    background: rgba(10, 10, 10, 0.92);
+    display: flex; align-items: center; justify-content: center;
+    touch-action: none; overscroll-behavior: contain;
+  }
+  #lb-overlay img {
+    max-width: 96vw; max-height: 92vh;
+    user-select: none; -webkit-user-drag: none;
+    cursor: grab; border-radius: 4px;
+  }
+  #lb-overlay img.dragging { cursor: grabbing; }
+  #lb-toolbar {
+    position: fixed; top: 12px; right: 14px; z-index: 1001;
+    display: flex; gap: 8px;
+  }
+  #lb-toolbar button {
+    width: 38px; height: 38px; border: 0; border-radius: 8px;
+    background: rgba(255, 255, 255, 0.14); color: #fff;
+    font-size: 19px; line-height: 1; cursor: pointer;
+  }
+  #lb-toolbar button:hover { background: rgba(255, 255, 255, 0.28); }
+  #lb-caption {
+    position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%);
+    max-width: 80vw; z-index: 1001;
+    color: #ddd; font-size: 0.85rem; text-align: center;
+    background: rgba(10, 10, 10, 0.6); padding: 4px 12px; border-radius: 8px;
+  }
+</style>
+
+<script>
+(function () {
+  var overlay = null, img = null, scale = 1, tx = 0, ty = 0;
+  var pointers = new Map(), lastMid = null, lastDist = 0;
+
+  function apply() {
+    img.style.transform =
+      "translate(" + tx + "px," + ty + "px) scale(" + scale + ")";
+  }
+
+  function zoomAt(cx, cy, factor) {
+    var ns = Math.min(10, Math.max(0.4, scale * factor));
+    var k = ns / scale;
+    // element is centered in the viewport; cursor offsets are vs center
+    var ox = cx - window.innerWidth / 2, oy = cy - window.innerHeight / 2;
+    tx = ox - (ox - tx) * k;
+    ty = oy - (oy - ty) * k;
+    scale = ns;
+    apply();
+  }
+
+  function close() {
+    if (!overlay) return;
+    document.body.style.overflow = "";
+    overlay.remove(); overlay = null; img = null;
+    document.removeEventListener("keydown", onKey);
+  }
+
+  function onKey(e) {
+    if (e.key === "Escape") close();
+    if (e.key === "+" || e.key === "=")
+      zoomAt(innerWidth / 2, innerHeight / 2, 1.3);
+    if (e.key === "-") zoomAt(innerWidth / 2, innerHeight / 2, 1 / 1.3);
+  }
+
+  function open(src, caption) {
+    scale = 1; tx = 0; ty = 0; pointers.clear();
+    overlay = document.createElement("div");
+    overlay.id = "lb-overlay";
+    overlay.innerHTML =
+      '<div id="lb-toolbar">' +
+      '<button data-a="out" title="zoom out">&minus;</button>' +
+      '<button data-a="in" title="zoom in">+</button>' +
+      '<button data-a="reset" title="reset">&#8634;</button>' +
+      '<button data-a="close" title="close">&times;</button></div>' +
+      '<img src="' + src + '" alt="">' +
+      (caption ? '<div id="lb-caption"></div>' : "");
+    document.body.appendChild(overlay);
+    document.body.style.overflow = "hidden";
+    img = overlay.querySelector("img");
+    if (caption) overlay.querySelector("#lb-caption").textContent = caption;
+
+    overlay.addEventListener("click", function (e) {
+      var a = e.target.dataset && e.target.dataset.a;
+      if (a === "close" || e.target === overlay) close();
+      else if (a === "in") zoomAt(innerWidth / 2, innerHeight / 2, 1.3);
+      else if (a === "out") zoomAt(innerWidth / 2, innerHeight / 2, 1 / 1.3);
+      else if (a === "reset") { scale = 1; tx = ty = 0; apply(); }
+    });
+    overlay.addEventListener("wheel", function (e) {
+      e.preventDefault();
+      zoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.15 : 1 / 1.15);
+    }, { passive: false });
+    img.addEventListener("dblclick", function (e) {
+      if (scale > 1.01) { scale = 1; tx = ty = 0; apply(); }
+      else zoomAt(e.clientX, e.clientY, 2.5);
+    });
+
+    img.addEventListener("pointerdown", function (e) {
+      e.preventDefault();
+      img.setPointerCapture(e.pointerId);
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (pointers.size === 1) img.classList.add("dragging");
+      lastMid = null; lastDist = 0;
+    });
+    img.addEventListener("pointermove", function (e) {
+      if (!pointers.has(e.pointerId)) return;
+      var p = pointers.get(e.pointerId);
+      if (pointers.size === 1) {
+        tx += e.clientX - p.x; ty += e.clientY - p.y; apply();
+      }
+      p.x = e.clientX; p.y = e.clientY;
+      if (pointers.size === 2) {
+        var pts = Array.from(pointers.values());
+        var dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+        var mid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+        if (lastDist) zoomAt(mid.x, mid.y, dist / lastDist);
+        if (lastMid) { tx += mid.x - lastMid.x; ty += mid.y - lastMid.y; apply(); }
+        lastDist = dist; lastMid = mid;
+      }
+    });
+    function drop(e) {
+      pointers.delete(e.pointerId);
+      lastMid = null; lastDist = 0;
+      if (!pointers.size) img.classList.remove("dragging");
+    }
+    img.addEventListener("pointerup", drop);
+    img.addEventListener("pointercancel", drop);
+
+    document.addEventListener("keydown", onKey);
+  }
+
+  document.addEventListener("click", function (e) {
+    var t = e.target;
+    if (t.tagName === "IMG" && t.closest(".post-content") && !overlay)
+      open(t.currentSrc || t.src, t.alt || "");
+  });
+})();
+</script>
+
+
+<script async id="MathJax-script"
+  src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+
+  </main>
+
+  <footer class="site-footer">
+    <div class="footer-links">
+      <a href="mailto:naveenraj.k@nyu.edu">Email</a>
+      <a href="https://github.com/therealnaveenkamal">GitHub</a>
+      <a href="https://scholar.google.com/citations?user=mnWK5uEAAAAJ">Scholar</a>
+      <a href="https://www.linkedin.com/in/navz">LinkedIn</a>
+    </div>
+    <p class="footer-credit">Layout inspired by <a href="https://jonbarron.info">Jon Barron</a> and <a href="https://lilianweng.github.io">Lil'Log</a></p>
+  </footer>
+
+  <script>
+    document.getElementById("theme-toggle").addEventListener("click", function () {
+      var dark = document.documentElement.classList.toggle("dark");
+      localStorage.setItem("theme", dark ? "dark" : "light");
+    });
+  </script>
+</body>
+
+</html>
